@@ -1,16 +1,18 @@
 name: 沪铜期货价格监控推送
 
 on:
+  push:
+    paths:
+      - 'copper_push.py'
   schedule:
-    # 北京时间周一至周六 08:00 = UTC 00:00
     - cron: '0 0 * * 1-6'
-  workflow_dispatch:  # 允许手动触发测试
+  workflow_dispatch:
 
 jobs:
   copper-push:
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # 允许回写记录文件
+      contents: write
 
     steps:
       - name: 检出仓库
