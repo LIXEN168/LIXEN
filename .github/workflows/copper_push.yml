@@ -1,0 +1,38 @@
+name: 沪铜期货价格监控推送
+
+on:
+  schedule:
+    # 北京时间周一至周六 08:00 = UTC 00:00
+    - cron: '0 0 * * 1-6'
+  workflow_dispatch:  # 允许手动触发测试
+
+jobs:
+  copper-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # 允许回写记录文件
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: |
+          pip install requests beautifulsoup4 playwright
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: 执行铜价推送
+        run: python copper_push.py
+
+      - name: 提交记录文件
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "更新铜价记录 [skip ci]"
+          file_pattern: copper_record.txt
+          commit_options: '--allow-empty'
