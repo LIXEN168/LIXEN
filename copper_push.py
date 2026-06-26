@@ -7,7 +7,6 @@ import json
 import os
 import re
 from datetime import datetime, timedelta
-from bs4 import BeautifulSoup
 
 # ========== 配置 ==========
 WEBHOOK_URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=2fecf72e-96fa-4ba1-9a50-ab490f9c6319"
@@ -15,97 +14,123 @@ RECORD_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "copper_r
 
 # ========== 第一步：获取沪铜实时价格 ==========
 def get_shfe_copper():
-    """从金投网获取沪铜主力合约最新价"""
-    # 先尝试用 playwright 抓取（需要 GitHub Actions 安装 playwright）
-    # 如果 playwright 不可用，用替代方案
-    url = "https://www.cngold.org/qihuo/hutong.html"
+    """
+    获取沪铜主力最新价，多层回退：
+    1. playwright 抓取金投网（最准确）
+    2. 新浪财经API - CU0连续合约
+    3. 百度搜索提取
+    """
+    # 方案1：playwright 抓取金投网页面
     try:
-        # 尝试 playwright（需要额外依赖）
         from playwright.sync_api import sync_playwright
+        from bs4 import BeautifulSoup
+        
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(headless=True, args=['--no-sandbox'])
             page = browser.new_page()
-            page.goto(url, timeout=30000, wait_until="networkidle")
+            page.goto("https://www.cngold.org/qihuo/hutong.html", timeout=30000, wait_until="networkidle")
             html = page.content()
             browser.close()
         
         soup = BeautifulSoup(html, "html.parser")
-        # 查找价格元素
-        price_elems = soup.select(".price, .latest, .js_price, [class*='price']")
-        for elem in price_elems:
-            text = elem.get_text(strip=True)
-            # 匹配数字
-            match = re.search(r'(\d{5,6})', text.replace(",", ""))
-            if match:
-                price = int(match.group(1))
-                if 50000 < price < 200000:
-                    return price
-    except Exception:
-        pass
+        # 查找价格元素 - 金投网页面通常有 class 包含 price/latest 的元素
+        for selector in [".price", ".latest", ".js_price", "[class*='price']", "span.red", ".num"]:
+            elems = soup.select(selector)
+            for elem in elems:
+                text = elem.get_text(strip=True).replace(",", "")
+                match = re.search(r'(\d{5,6})', text)
+                if match:
+                    price = int(match.group(1))
+                    if 70000 < price < 200000:
+                        print(f"  [playwright] 从 '{selector}' 提取到: {price}")
+                        return price
+        
+        # 如果选择器没命中，全页面搜索
+        text = soup.get_text()
+        prices = re.findall(r'(\d{5,6})', text)
+        valid = [int(p) for p in prices if 70000 < int(p) < 200000]
+        if valid:
+            from collections import Counter
+            price = Counter(valid).most_common(1)[0][0]
+            print(f"  [playwright] 全页搜索最频价格: {price}")
+            return price
+    except Exception as e:
+        print(f"  [playwright] 失败: {e}")
     
-    # 回退方案：用百度搜索前一日收盘价
+    # 方案2：新浪财经API - CU0
+    try:
+        url = "https://hq.sinajs.cn/list=nf_CU0"
+        headers = {"Referer": "https://finance.sina.com.cn", "User-Agent": "Mozilla/5.0"}
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.encoding = "gbk"
+        match = re.search(r'"([^"]+)"', resp.text)
+        if match:
+            parts = match.group(1).split(",")
+            # 新浪期货字段：0名称,1最新价,2今开,3昨收...
+            # CU0连续合约字段特殊，尝试多个索引
+            for idx in [1, 8, 2]:  # 最新价 > 买一价 > 今开
+                try:
+                    price = int(float(parts[idx]))
+                    if 70000 < price < 200000:
+                        print(f"  [sina-CU0] 索引{idx}: {price}")
+                        return price
+                except (ValueError, IndexError):
+                    continue
+    except Exception as e:
+        print(f"  [sina-CU0] 失败: {e}")
+    
+    # 方案3：百度搜索
     try:
         search_url = "https://www.baidu.com/s?wd=沪铜主力 最新价"
         headers = {"User-Agent": "Mozilla/5.0"}
         resp = requests.get(search_url, headers=headers, timeout=15)
-        # 从搜索结果摘要中提取价格
         matches = re.findall(r'(\d{5,6})\s*元', resp.text)
         for m in matches:
             price = int(m)
-            if 50000 < price < 200000:
+            if 70000 < price < 200000:
+                print(f"  [baidu] 提取到: {price}")
                 return price
-    except Exception:
-        pass
-    
-    # 再回退：新浪财经API
-    try:
-        api_url = "https://hq.sinajs.cn/list=nf_CU0"
-        headers = {"Referer": "https://finance.sina.com.cn", "User-Agent": "Mozilla/5.0"}
-        resp = requests.get(api_url, headers=headers, timeout=10)
-        resp.encoding = "gbk"
-        # 格式: var hq_str_nf_CU0="沪铜连续,104230,..."
-        match = re.search(r'"([^"]+)"', resp.text)
-        if match:
-            parts = match.group(1).split(",")
-            if len(parts) >= 2:
-                price = int(float(parts[1]))
-                return price
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  [baidu] 失败: {e}")
     
     return None
 
 # ========== 第二步：获取长江1#铜D-2日均价 ==========
 def get_changjiang_avg_price(target_date_str):
     """
-    获取长江1#铜日均价
-    target_date_str: D-2日期，格式 2026-06-24
+    获取D-2日长江1#铜日均价
+    target_date_str: 格式 2026-06-24
+    回退链：百度搜索 → 新浪文章 → 新浪行情页
     """
-    # 策略1：搜索新浪财经
+    # 策略1：百度搜索
     try:
-        search_url = f"https://www.baidu.com/s?wd=长江有色 {target_date_str} 铜价 1#铜"
+        search_url = f"https://www.baidu.com/s?wd=长江有色 {target_date_str} 1#铜 均价"
         headers = {"User-Agent": "Mozilla/5.0"}
         resp = requests.get(search_url, headers=headers, timeout=15)
-        # 从搜索结果提取价格
         matches = re.findall(r'(\d{5,6})\s*(?:元|￥)', resp.text)
         if matches:
             prices = [int(m) for m in matches if 60000 < int(m) < 150000]
             if prices:
-                return max(set(prices), key=prices.count) if len(prices) > 2 else prices[0]
-    except Exception:
-        pass
+                from collections import Counter
+                price = Counter(prices).most_common(1)[0][0]
+                print(f"  [baidu] 长江均价: {price}")
+                return price
+    except Exception as e:
+        print(f"  [baidu-长江] 失败: {e}")
     
-    # 策略2：新浪财经铜价页面
+    # 策略2：新浪财经搜索
     try:
-        url = "https://finance.sina.com.cn/futures/quotes/CU0.shtml"
+        search_url = f"https://search.sina.com.cn/?q=长江现货+1%23铜+{target_date_str}&range=all&c=news"
         headers = {"User-Agent": "Mozilla/5.0"}
-        resp = requests.get(url, headers=headers, timeout=15)
-        resp.encoding = "utf-8"
-        matches = re.findall(r'长江.*?1#.*?(\d{5,6})', resp.text)
+        resp = requests.get(search_url, headers=headers, timeout=15)
+        matches = re.findall(r'(\d{5,6})\s*元/吨', resp.text)
         if matches:
-            return int(matches[0])
-    except Exception:
-        pass
+            prices = [int(m) for m in matches if 60000 < int(m) < 150000]
+            if prices:
+                print(f"  [sina-search] 长江均价: {prices[0]}")
+                return prices[0]
+    except Exception as e:
+        print(f"  [sina-search] 失败: {e}")
     
     return None
 
